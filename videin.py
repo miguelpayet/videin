@@ -8,13 +8,13 @@ Samples intervals from .ts video files and concatenates them into a single MP4 o
 import argparse
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import shutil
 
 import av
 
@@ -323,53 +323,58 @@ def display_timeline(intervals: list[Interval], interval_duration: float) -> Non
     print("=" * 80 + "\n")
 
 
+def _extract_single_sample(i: int, sample: Sample, temp_dir: Path, ffmpeg_path: str) -> tuple[int, Path | None, str]:
+    """Extract a single sample segment using FFmpeg. Returns (index, output_file, status_message)."""
+    output_file = temp_dir / f"sample_{i:03d}.mp4"
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hwaccel", "auto",
+        "-i", str(sample.source_file.path),
+        "-ss", str(sample.file_offset),
+        "-t", str(sample.duration),
+        "-c:v", "h264_amf",
+        "-c:a", "aac",
+        "-shortest",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        str(output_file)
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        # Find the actual error message (skip version info)
+        lines = result.stderr.split('\n')
+        error_lines = [l for l in lines if 'Error' in l or 'error' in l or 'Unable' in l]
+        error_msg = '\n'.join(error_lines[-3:]) if error_lines else result.stderr[-500:]
+        return (i, None, f"ERROR: {error_msg}")
+
+    if output_file.exists():
+        try:
+            with av.open(str(output_file)) as container:
+                duration = container.duration / av.time_base if container.duration else 0
+            return (i, output_file, f"OK: {output_file.name} ({format_duration(duration)})")
+        except Exception as e:
+            return (i, None, f"ERROR verifying: {e}")
+    else:
+        return (i, None, "ERROR: Output file not created")
+
+
 def extract_samples(samples: list[Sample], temp_dir: Path) -> list[Path]:
-    """Extract each sample segment using FFmpeg."""
+    """Extract each sample segment using FFmpeg sequentially."""
     print("\n" + "=" * 80)
     print("EXTRACTING SAMPLES")
     print("=" * 80 + "\n")
 
     extracted_files = []
-
     for i, sample in enumerate(samples):
-        output_file = temp_dir / f"sample_{i:03d}.mp4"
-
-        cmd = [
-            FFMPEG_PATH,
-            "-y",
-            "-i", str(sample.source_file.path),
-            "-ss", str(sample.file_offset),
-            "-t", str(sample.duration),
-            "-c:v", "libx264",
-            "-preset", "slow",
-            "-crf", "18",
-            "-tune", "zerolatency",
-            "-x264-params", "bframes=0",
-            "-c:a", "aac",
-            "-shortest",
-            "-fflags", "+genpts",
-            "-avoid_negative_ts", "make_zero",
-            str(output_file)
-        ]
-
         print(f"Extracting sample {i}: {sample.source_file.filename} @ {format_duration(sample.file_offset)}")
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            print(f"  ERROR: {result.stderr[:200]}")
-            continue
-
-        if output_file.exists():
-            try:
-                with av.open(str(output_file)) as container:
-                    duration = container.duration / av.time_base if container.duration else 0
-                    print(f"  OK: {output_file.name} ({format_duration(duration)})")
-                extracted_files.append(output_file)
-            except Exception as e:
-                print(f"  ERROR verifying: {e}")
-        else:
-            print(f"  ERROR: Output file not created")
+        _, output_file, status_msg = _extract_single_sample(i, sample, temp_dir, FFMPEG_PATH)
+        print(f"  {status_msg}")
+        if output_file:
+            extracted_files.append(output_file)
 
     print(f"\nExtracted {len(extracted_files)} / {len(samples)} samples")
     print("=" * 80 + "\n")
