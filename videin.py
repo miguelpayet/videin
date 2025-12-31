@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -57,21 +58,26 @@ FFMPEG_PATH = "ffmpeg"
 
 
 def find_ffmpeg() -> str | None:
-    """Find FFmpeg executable, checking common locations on Windows."""
+    """Find FFmpeg executable, checking common locations."""
     common_paths = [
         "ffmpeg",
         r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
         r"C:\ffmpeg\bin\ffmpeg.exe",
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
     ]
 
     for path in common_paths:
         try:
-            result = subprocess.run(
-                [path, "-version"],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            )
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+            result = subprocess.run([path, "-version"], **kwargs)
             if result.returncode == 0:
                 return path
         except FileNotFoundError:
@@ -99,6 +105,14 @@ def parse_arguments() -> argparse.Namespace:
         "total_duration",
         type=float,
         help="Total duration of output video (in seconds)"
+    )
+
+    default_codec = "h264_videotoolbox" if sys.platform == "darwin" else "libx264"
+    parser.add_argument(
+        "--codec", "-c",
+        type=str,
+        default=default_codec,
+        help=f"Video codec for FFmpeg (default: {default_codec})"
     )
     return parser.parse_args()
 
@@ -139,7 +153,7 @@ def discover_video_files(directory: Path) -> list[VideoFile]:
     """Scan directory for .ts video files and read their metadata."""
     video_files = []
 
-    ts_files = list(directory.glob("*.ts"))
+    ts_files = [p for p in directory.iterdir() if p.suffix.lower() == '.ts']
 
     if not ts_files:
         print(f"No .ts files found in {directory}")
@@ -323,7 +337,8 @@ def display_timeline(intervals: list[Interval], interval_duration: float) -> Non
     print("=" * 80 + "\n")
 
 
-def _extract_single_sample(i: int, sample: Sample, temp_dir: Path, ffmpeg_path: str) -> tuple[int, Path | None, str]:
+def _extract_single_sample(i: int, sample: Sample, temp_dir: Path, ffmpeg_path: str, codec: str) -> tuple[
+    int, Path | None, str]:
     """Extract a single sample segment using FFmpeg. Returns (index, output_file, status_message)."""
     output_file = temp_dir / f"sample_{i:03d}.mp4"
 
@@ -334,7 +349,7 @@ def _extract_single_sample(i: int, sample: Sample, temp_dir: Path, ffmpeg_path: 
         "-i", str(sample.source_file.path),
         "-ss", str(sample.file_offset),
         "-t", str(sample.duration),
-        "-c:v", "h264_amf",
+        "-c:v", codec,
         "-c:a", "aac",
         "-shortest",
         "-fflags", "+genpts",
@@ -342,27 +357,29 @@ def _extract_single_sample(i: int, sample: Sample, temp_dir: Path, ffmpeg_path: 
         str(output_file)
     ]
 
+    start_time = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed_time = time.time() - start_time
 
     if result.returncode != 0:
         # Find the actual error message (skip version info)
         lines = result.stderr.split('\n')
         error_lines = [l for l in lines if 'Error' in l or 'error' in l or 'Unable' in l]
         error_msg = '\n'.join(error_lines[-3:]) if error_lines else result.stderr[-500:]
-        return (i, None, f"ERROR: {error_msg}")
+        return (i, None, f"ERROR ({elapsed_time:.2f}s): {error_msg}")
 
     if output_file.exists():
         try:
             with av.open(str(output_file)) as container:
                 duration = container.duration / av.time_base if container.duration else 0
-            return (i, output_file, f"OK: {output_file.name} ({format_duration(duration)})")
+            return (i, output_file, f"OK: {output_file.name} ({format_duration(duration)}) - {elapsed_time:.2f}s")
         except Exception as e:
-            return (i, None, f"ERROR verifying: {e}")
+            return (i, None, f"ERROR verifying ({elapsed_time:.2f}s): {e}")
     else:
-        return (i, None, "ERROR: Output file not created")
+        return (i, None, f"ERROR ({elapsed_time:.2f}s): Output file not created")
 
 
-def extract_samples(samples: list[Sample], temp_dir: Path) -> list[Path]:
+def extract_samples(samples: list[Sample], temp_dir: Path, codec: str) -> list[Path]:
     """Extract each sample segment using FFmpeg sequentially."""
     print("\n" + "=" * 80)
     print("EXTRACTING SAMPLES")
@@ -371,7 +388,7 @@ def extract_samples(samples: list[Sample], temp_dir: Path) -> list[Path]:
     extracted_files = []
     for i, sample in enumerate(samples):
         print(f"Extracting sample {i}: {sample.source_file.filename} @ {format_duration(sample.file_offset)}")
-        _, output_file, status_msg = _extract_single_sample(i, sample, temp_dir, FFMPEG_PATH)
+        _, output_file, status_msg = _extract_single_sample(i, sample, temp_dir, FFMPEG_PATH, codec)
         print(f"  {status_msg}")
         if output_file:
             extracted_files.append(output_file)
@@ -497,7 +514,7 @@ def main() -> int:
     output_path = directory / "output.mp4"
 
     try:
-        extracted_files = extract_samples(samples, temp_dir)
+        extracted_files = extract_samples(samples, temp_dir, args.codec)
 
         if not extracted_files:
             print("Error: No samples were extracted.")
