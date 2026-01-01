@@ -342,41 +342,53 @@ def _extract_single_sample(i: int, sample: Sample, temp_dir: Path, ffmpeg_path: 
     """Extract a single sample segment using FFmpeg. Returns (index, output_file, status_message)."""
     output_file = temp_dir / f"sample_{i:03d}.mp4"
 
+    # Get frame rate from source and calculate exact frame count
+    try:
+        with av.open(str(sample.source_file.path)) as container:
+            video_stream = next((s for s in container.streams if s.type == 'video'), None)
+            if video_stream:
+                fps = float(video_stream.average_rate)
+            else:
+                # Fallback if no video stream found (unlikely given previous checks)
+                fps = 30.0
+    except Exception as e:
+        return (i, None, f"ERROR reading metadata: {e}")
+    
+    # Calculate exact number of frames for the requested duration
+    frame_count = int(round(sample.duration * fps))
+
     cmd = [
         ffmpeg_path,
         "-y",
         "-hwaccel", "auto",
         "-i", str(sample.source_file.path),
         "-ss", str(sample.file_offset),
-        "-t", str(sample.duration),
+        "-frames:v", str(frame_count),
         "-c:v", codec,
-        "-c:a", "aac",
-        "-shortest",
+        "-an",  # Remove audio
         "-fflags", "+genpts",
         "-avoid_negative_ts", "make_zero",
         str(output_file)
     ]
 
-    start_time = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
-    elapsed_time = time.time() - start_time
 
     if result.returncode != 0:
         # Find the actual error message (skip version info)
         lines = result.stderr.split('\n')
         error_lines = [l for l in lines if 'Error' in l or 'error' in l or 'Unable' in l]
         error_msg = '\n'.join(error_lines[-3:]) if error_lines else result.stderr[-500:]
-        return (i, None, f"ERROR ({elapsed_time:.2f}s): {error_msg}")
+        return (i, None, f"ERROR: {error_msg}")
 
     if output_file.exists():
         try:
             with av.open(str(output_file)) as container:
                 duration = container.duration / av.time_base if container.duration else 0
-            return (i, output_file, f"OK: {output_file.name} ({format_duration(duration)}) - {elapsed_time:.2f}s")
+            return (i, output_file, f"OK: {output_file.name} ({format_duration(duration)}) - {frame_count} frames")
         except Exception as e:
-            return (i, None, f"ERROR verifying ({elapsed_time:.2f}s): {e}")
+            return (i, None, f"ERROR verifying: {e}")
     else:
-        return (i, None, f"ERROR ({elapsed_time:.2f}s): Output file not created")
+        return (i, None, "ERROR: Output file not created")
 
 
 def extract_samples(samples: list[Sample], temp_dir: Path, codec: str) -> list[Path]:
